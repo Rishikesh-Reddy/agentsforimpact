@@ -73,58 +73,86 @@ export async function analyzeElements(
       context: el.context,
     }))
 
-    const systemPrompt = `You are a senior WCAG 2.1 AA accessibility auditor with 15 years of legal compliance experience. Your audits must be accurate — both false negatives (missing real issues) and false positives (inventing issues) harm your clients.
+    const systemPrompt = `You are a WCAG 2.1 AA conformance evaluator. Your only job is to determine whether HTML elements FAIL the exact normative WCAG 2.1 success criteria as written at w3.org/WAI/WCAG21/. 
 
-CORE RULES:
-- Only flag violations you can directly observe in the provided HTML and context
-- If the context field says a value is PRESENT (e.g. "lang attribute: en ✓"), do NOT flag it as missing
-- If context says "Accessible name found", do NOT flag that element as unlabeled
-- A descriptive alt text on an image-only link (e.g. alt="W3C logo") is a WARNING, not a CRITICAL — the link has an accessible name, it's just potentially non-descriptive enough
-- Image-only link is CRITICAL only when alt="" (completely empty, no accessible name at all)
-- Do NOT flag the same element twice for the same criterion
-- Do NOT speculate about issues not visible in the HTML (e.g. "page title may not describe content" without seeing a bad title)
-- A page can genuinely pass — returning zero violations is correct and acceptable when the HTML is clean
+You do NOT apply your own accessibility preferences, best practices, or opinions. You ONLY apply the precise pass/fail conditions from the official spec.
 
-Always respond with valid JSON only — no markdown fences, no explanation outside the JSON. /no_think`
+A page can fully pass. Return an empty violations array when nothing fails the spec.
+Always respond with valid JSON only — no markdown, no text outside the JSON. /no_think`
 
-    const userPrompt = `Audit these HTML elements from ${pageUrl} for WCAG 2.1 AA violations.
+    const userPrompt = `Evaluate these HTML elements from ${pageUrl} strictly against the WCAG 2.1 success criteria below.
 
-The crawler has pre-annotated findings in the "context" field. Trust the context:
-- Context saying "MISSING", "NO ACCESSIBLE NAME", "LIKELY LAYOUT TABLE", or "SUSPICIOUS" → real violation, flag it
-- Context saying "✓", "Accessible name found", "present" → element passes that check, do NOT flag it
-- Context saying "WARNING: non-descriptive link text" → flag as WARNING only (not CRITICAL)
+The crawler has pre-analysed each element. The "context" field tells you what it found:
+- Context containing "CRITICAL:" or "WARNING:" or "MISSING" or "NO ACCESSIBLE NAME" or "SUSPICIOUS" → investigate and flag if the spec confirms it
+- Context containing "PASS:" or "✓" or "Accessible name found" → the element passes that check. Do NOT flag it.
 
-ELEMENTS TO ANALYZE:
+ELEMENTS:
 ${JSON.stringify(elementsJson, null, 2)}
 
-WCAG CRITERIA TO CHECK:
-${WCAG_CRITERIA.map(c => `- ${c.id} ${c.name} (Level ${c.level}): ${c.desc}`).join('\n')}
+━━━ EXACT WCAG 2.1 PASS/FAIL CONDITIONS ━━━
+Apply ONLY these rules. Do not add stricter rules of your own.
 
-ADDITIONAL CRITERIA:
-- 1.3.2 Meaningful Sequence (A): Reading order must be logical when linearized
-- 2.4.1 Bypass Blocks (A): Skip navigation link required
-- 2.4.2 Page Titled (A): Page title must describe content
-- 3.1.1 Language of Page (A): html lang attribute required
+1.1.1 Non-text Content (Level A)
+  FAIL: img element has no alt attribute at all
+  FAIL: img used as sole content of a link and alt="" (empty) → link has no accessible name
+  FAIL: img alt attribute contains only a filename, number, or the words "image"/"photo"/"spacer"/"bullet"/"graphic"
+  PASS: any other non-empty alt text, even if imperfect (e.g. "W3C logo", "company banner", "Clara F.'s website")
+  PASS: alt="" when image is decorative and NOT the sole content of a link
 
-SEVERITY GUIDE:
-- CRITICAL: completely blocks access (img missing alt entirely, input with zero accessible name, keyboard trap)
-- WARNING: degrades experience but workaround exists (bad alt quality, non-descriptive link text, layout table, skipped heading levels)
-- Do NOT invent a third severity — only critical or warning
+2.4.4 Link Purpose — In Context (Level AA)
+  FAIL: link whose accessible name (visible text + all img alt text + aria-label + title) is empty or completely non-descriptive (e.g. "click here", "read more", "here", "more", "link")
+  PASS: image-only link where the img alt text names the destination or subject (e.g. alt="W3C logo", alt="BBC News", alt="Clara F.'s website") — this IS sufficient under 2.4.4
+  PASS: link text that describes a real topic, even if informal (e.g. "the way that air conditioning works", "trombone forgery debacle") — these are descriptive
+  DO NOT FLAG: logo image links to the organisation they represent
+  DO NOT FLAG: image links where alt clearly identifies the subject or destination
 
-DEDUPLICATION: If you see the same element appear in multiple batches, report it only once.
+3.3.2 Labels or Instructions (Level A)
+  FAIL: input/textarea/select with NO label element (for/id), NO aria-label, NO aria-labelledby, NO title attribute
+  PASS: input[type="submit"] or input[type="button"] with a value attribute — the value IS the accessible name
+  PASS: any input where context says "Accessible name found"
 
-Respond ONLY with this JSON (no markdown, no text outside JSON):
+2.4.6 Headings and Labels (Level AA)
+  FAIL: heading text is empty or purely generic (e.g. "heading", "title", "section")
+  FAIL: label text is empty or purely generic
+  PASS: skipped heading levels (h1→h3) — this is NOT a 2.4.6 failure (it may be a 1.3.1 concern but is not a 2.4.6 violation)
+  PASS: any heading with meaningful text, regardless of level order
+
+1.3.1 Info and Relationships (Level A)
+  FAIL: content that is visually presented as a list, table, or heading but has NO semantic markup at all
+  FAIL: form fields with no programmatic label whatsoever
+  PASS: heading level skips — these do not violate 1.3.1 per se
+
+3.1.1 Language of Page (Level A)
+  FAIL: html element missing lang attribute entirely
+  PASS: html element has any valid lang attribute (e.g. lang="en", lang="fr")
+  DO NOT FLAG if context says lang is present
+
+2.4.1 Bypass Blocks (Level A)
+  FAIL: page has repeated navigation blocks AND no skip link, no landmark regions (main/nav), and no heading structure to bypass them
+  PASS: page has landmark regions (main, nav) OR a skip link — either satisfies 2.4.1
+  DO NOT FLAG viewport meta tag — that is not related to 2.4.1
+
+2.4.2 Page Titled (Level A)  
+  FAIL: title element is missing or empty
+  PASS: title element exists with any text content
+
+━━━ SEVERITY ━━━
+CRITICAL: element completely blocks access for AT users (no accessible name, missing title, missing lang)
+WARNING: element degrades experience but has a partial workaround
+
+━━━ RESPONSE FORMAT ━━━
+Respond ONLY with valid JSON. Empty array is correct when nothing fails:
 {
   "violations": [
     {
       "criterionId": "1.1.1",
       "criterionName": "Non-text Content",
       "severity": "critical",
-      "issue": "Specific description referencing the actual element",
-      "currentCode": "The exact bad HTML snippet (max 200 chars)",
-      "fixedCode": "The corrected HTML (max 200 chars)",
-      "explanation": "Why this matters for users with disabilities",
-      "impact": "Which users are affected and how"
+      "issue": "Precise description of what specifically fails the criterion",
+      "currentCode": "The exact failing HTML (max 200 chars)",
+      "fixedCode": "The minimal corrected HTML (max 200 chars)",
+      "explanation": "Which AT users are blocked and exactly how",
+      "impact": "e.g. Screen reader announces nothing for this image link"
     }
   ]
 }`
