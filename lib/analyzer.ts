@@ -73,24 +73,26 @@ export async function analyzeElements(
       context: el.context,
     }))
 
-    const systemPrompt = `You are a senior WCAG 2.1 AA accessibility auditor with 15 years of experience conducting legal compliance audits. You have expert knowledge of all WCAG failure techniques (F1–F107).
+    const systemPrompt = `You are a senior WCAG 2.1 AA accessibility auditor with 15 years of legal compliance experience. Your audits must be accurate — both false negatives (missing real issues) and false positives (inventing issues) harm your clients.
 
-Your job is to find REAL violations — including subtle ones that automated tools miss. You understand that:
-- An image with alt="bullet" is a VIOLATION (F39: non-null alt on decorative image)
-- An image with alt="1234 56789" is a VIOLATION (F30: alt is not a real alternative)  
-- An image with 150+ word verbose alt is a VIOLATION (F30: not serving equivalent purpose)
-- A link containing only an image with alt="" has NO accessible name (F89: WCAG 2.4.4 failure)
-- A CSS background-image with only a title attribute is a VIOLATION (F3: CSS image with info, no text alt)
-- Layout tables break reading order for screen readers (F49: WCAG 1.3.2 failure)
-- Text styled to look like a heading but not using h1-h6 is a VIOLATION (F2: WCAG 1.3.1)
-- Missing lang attribute on <html> is a VIOLATION (WCAG 3.1.1)
-- Generic link text "Read more", "Click here", "More" is a VIOLATION (F84: WCAG 2.4.4)
-
-You MUST flag violations in the context field when the crawler has already identified them. If context says "MISSING", "WARNING", "SUSPICIOUS", "NO ACCESSIBLE NAME", or "LIKELY LAYOUT TABLE" — that IS a violation and you MUST include it.
+CORE RULES:
+- Only flag violations you can directly observe in the provided HTML and context
+- If the context field says a value is PRESENT (e.g. "lang attribute: en ✓"), do NOT flag it as missing
+- If context says "Accessible name found", do NOT flag that element as unlabeled
+- A descriptive alt text on an image-only link (e.g. alt="W3C logo") is a WARNING, not a CRITICAL — the link has an accessible name, it's just potentially non-descriptive enough
+- Image-only link is CRITICAL only when alt="" (completely empty, no accessible name at all)
+- Do NOT flag the same element twice for the same criterion
+- Do NOT speculate about issues not visible in the HTML (e.g. "page title may not describe content" without seeing a bad title)
+- A page can genuinely pass — returning zero violations is correct and acceptable when the HTML is clean
 
 Always respond with valid JSON only — no markdown fences, no explanation outside the JSON. /no_think`
 
-    const userPrompt = `Audit these HTML elements from ${pageUrl} for WCAG 2.1 AA violations. The crawler has pre-annotated suspected issues in the "context" field — treat these as strong signals that require a violation entry.
+    const userPrompt = `Audit these HTML elements from ${pageUrl} for WCAG 2.1 AA violations.
+
+The crawler has pre-annotated findings in the "context" field. Trust the context:
+- Context saying "MISSING", "NO ACCESSIBLE NAME", "LIKELY LAYOUT TABLE", or "SUSPICIOUS" → real violation, flag it
+- Context saying "✓", "Accessible name found", "present" → element passes that check, do NOT flag it
+- Context saying "WARNING: non-descriptive link text" → flag as WARNING only (not CRITICAL)
 
 ELEMENTS TO ANALYZE:
 ${JSON.stringify(elementsJson, null, 2)}
@@ -100,47 +102,32 @@ ${WCAG_CRITERIA.map(c => `- ${c.id} ${c.name} (Level ${c.level}): ${c.desc}`).jo
 
 ADDITIONAL CRITERIA:
 - 1.3.2 Meaningful Sequence (A): Reading order must be logical when linearized
-- 2.4.1 Bypass Blocks (A): A mechanism must be available to skip repeated navigation
-- 2.4.2 Page Titled (A): Web pages have titles that describe topic or purpose
-- 3.1.1 Language of Page (A): Default human language of each page can be programmatically determined
+- 2.4.1 Bypass Blocks (A): Skip navigation link required
+- 2.4.2 Page Titled (A): Page title must describe content
+- 3.1.1 Language of Page (A): html lang attribute required
 
-VIOLATION DETECTION RULES — apply all of these:
-1. img missing alt attribute → CRITICAL (1.1.1)
-2. img alt="" when image is the only content of a link → CRITICAL (2.4.4 + 4.1.2)  
-3. img with alt="bullet", "image", "photo", "spacer", or any generic word → WARNING (1.1.1 F39)
-4. img with alt that is a number or looks like a filename → WARNING (1.1.1 F30)
-5. img with alt longer than 100 characters that is not a complex image → WARNING (1.1.1 F30)
-6. CSS background-image used for informational image (title attr ≠ proper text alt) → CRITICAL (1.1.1 F3)
-7. Link text is "Read more", "Read More...", "Click here", "More", "here" → WARNING (2.4.4 F84)
-8. Input/textarea/select with no label, no aria-label, no aria-labelledby → CRITICAL (3.3.2 + 1.3.1)
-9. Table with no th, no caption, many cells → likely layout table → WARNING (1.3.1 + 1.3.2 F49)
-10. Missing lang attribute on html element → WARNING (3.1.1)
-11. No skip navigation link → WARNING (2.4.1)
-12. Heading levels skip (e.g. H1 → H4) → WARNING (2.4.6)
-13. No heading elements at all → WARNING (1.3.1)
-14. Visual headings implemented as <div> or <span> without heading role → CRITICAL (1.3.1 F2)
+SEVERITY GUIDE:
+- CRITICAL: completely blocks access (img missing alt entirely, input with zero accessible name, keyboard trap)
+- WARNING: degrades experience but workaround exists (bad alt quality, non-descriptive link text, layout table, skipped heading levels)
+- Do NOT invent a third severity — only critical or warning
 
-For every flagged element, produce a violation. Respond ONLY with this JSON (no markdown, no text outside JSON):
+DEDUPLICATION: If you see the same element appear in multiple batches, report it only once.
+
+Respond ONLY with this JSON (no markdown, no text outside JSON):
 {
   "violations": [
     {
       "criterionId": "1.1.1",
       "criterionName": "Non-text Content",
       "severity": "critical",
-      "issue": "Specific plain-English description referencing the actual element and what is wrong",
-      "currentCode": "The exact bad HTML snippet from the element (max 200 chars)",
-      "fixedCode": "The corrected HTML showing exactly what to change (max 200 chars)",
-      "explanation": "Why this matters — specifically which users are harmed and how (be concrete)",
-      "impact": "e.g. Screen reader users cannot determine the image purpose"
+      "issue": "Specific description referencing the actual element",
+      "currentCode": "The exact bad HTML snippet (max 200 chars)",
+      "fixedCode": "The corrected HTML (max 200 chars)",
+      "explanation": "Why this matters for users with disabilities",
+      "impact": "Which users are affected and how"
     }
   ]
-}
-
-Severity:
-- critical = blocks access entirely (missing alt on functional image, unlabeled input, keyboard trap)
-- warning = significantly degrades experience (bad alt quality, ambiguous links, layout tables, missing lang)
-
-IMPORTANT: Do NOT return an empty violations array if context fields contain MISSING/WARNING/SUSPICIOUS flags. Those flags mean violations exist and must be reported.`
+}`
 
     try {
       const completion = await client.chat.completions.create({
@@ -175,6 +162,13 @@ IMPORTANT: Do NOT return an empty violations array if context fields contain MIS
       }
 
       for (const v of (parsed.violations || [])) {
+        // Deduplicate: skip if same criterion + same current code already recorded
+        const isDupe = allViolations.some(existing =>
+          existing.criterionId === v.criterionId &&
+          existing.currentCode?.trim().slice(0, 60) === v.currentCode?.trim().slice(0, 60)
+        )
+        if (isDupe) continue
+
         violationCounter++
         allViolations.push({
           id: `v${violationCounter}`,
@@ -198,12 +192,45 @@ IMPORTANT: Do NOT return an empty violations array if context fields contain MIS
     }
   }
 
+  // ── Post-processing: strip known hallucination patterns ─────────────────
+  // These are violations the model commonly invents when it lacks sufficient evidence.
+  const filtered = allViolations.filter(v => {
+    const issue = (v.issue ?? '').toLowerCase()
+    const fix   = (v.fixedCode ?? '').toLowerCase()
+    const current = (v.currentCode ?? '').toLowerCase()
+
+    // RULE 1: Don't flag lang/title/skip-nav as CRITICAL if the fix code
+    // just adds something generic — means the model assumed they were missing
+    // without seeing evidence. These should only appear if the crawler flagged them
+    // explicitly in the page-level element's context.
+    if (v.criterionId === '3.1.1' && !current.includes('lang') && !issue.includes('missing')) return false
+    if (v.criterionId === '2.4.2' && !current.includes('title') && !issue.includes('missing')) return false
+
+    // RULE 2: meta viewport is NOT a WCAG 2.4.1 criterion — pure hallucination
+    if (v.criterionId === '2.4.1' && (issue.includes('viewport') || fix.includes('viewport'))) return false
+
+    // RULE 3: missing <main>/<nav> landmarks alone ≠ a 3.1.1 lang violation
+    if (v.criterionId === '3.1.1' && (issue.includes('<main>') || issue.includes('<nav>'))) return false
+
+    // RULE 4: Image-only link with descriptive alt (>= 4 chars, not generic) is not a violation
+    // The crawler already marked these as PASS in the context field
+    if (v.criterionId === '2.4.4') {
+      // If the "current code" shows an img with a real alt text (not empty), downgrade to at most WARNING
+      const altMatch = current.match(/alt="([^"]+)"/)
+      if (altMatch && altMatch[1].length >= 4 && v.severity === 'critical') {
+        v.severity = 'warning'
+      }
+    }
+
+    return true
+  })
+
   log.push({
     agent: 'Analyzer',
     step: 'Analysis complete',
-    detail: `${allViolations.length} violations found (${allViolations.filter(v => v.severity === 'critical').length} critical)`,
+    detail: `${filtered.length} violations (${filtered.filter(v => v.severity === 'critical').length} critical) after filtering ${allViolations.length - filtered.length} false positives`,
     timestamp: Date.now(),
   })
 
-  return allViolations
+  return filtered
 }

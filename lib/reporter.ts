@@ -22,11 +22,20 @@ export async function generateReport(
   const warningCount  = violations.filter(v => v.severity === 'warning').length
   const passCount     = Math.max(0, totalElements - violations.length)
 
-  // Score: start at 100, deduct for violations
+  // Score: ratio-based, not raw-count-based.
+  // A compliant site with minor image-link warnings should still score 80+.
+  // Formula: start at 100, deduct proportionally to elements analyzed.
+  // Critical = 15pts per unique WCAG criterion failed (not per instance)
+  // Warning  = 5pts per unique WCAG criterion with warnings
+  const uniqueCriticalCriteria = new Set(violations.filter(v => v.severity === 'critical').map(v => v.criterionId)).size
+  const uniqueWarningCriteria  = new Set(violations.filter(v => v.severity === 'warning').map(v => v.criterionId)).size
+
   let score = 100
-  score -= criticalCount * 12
-  score -= warningCount  * 4
-  score = Math.max(0, Math.min(100, score))
+  score -= uniqueCriticalCriteria * 15
+  score -= uniqueWarningCriteria  * 5
+  // Extra penalty if criticals are numerous relative to element count
+  if (criticalCount > 3) score -= Math.min(15, (criticalCount - 3) * 3)
+  score = Math.max(0, Math.min(100, Math.round(score)))
 
   const grade =
     score >= 90 ? 'A' :
@@ -34,11 +43,11 @@ export async function generateReport(
     score >= 55 ? 'C' :
     score >= 35 ? 'D' : 'F'
 
-  // Legal risk
-  const legalRiskScore = Math.min(100, criticalCount * 15 + warningCount * 5)
+  // Legal risk based on critical criterion count, not instance count
+  const legalRiskScore = Math.min(100, uniqueCriticalCriteria * 20 + uniqueWarningCriteria * 5)
   const legalRisk =
     legalRiskScore >= 60 ? 'High' :
-    legalRiskScore >= 30 ? 'Medium' : 'Low'
+    legalRiskScore >= 25 ? 'Medium' : 'Low'
 
   // Group by WCAG criterion
   const groupMap = new Map<string, CriterionGroup>()
@@ -87,34 +96,42 @@ export async function generateReport(
       `- [${v.severity.toUpperCase()}] ${v.criterionId} ${v.criterionName}: ${v.issue}`
     ).join('\n')
 
+    const passingNote = violations.length === 0
+      ? 'No violations were found — the page appears to meet WCAG 2.1 AA standards.'
+      : ''
+
     const completion = await client.chat.completions.create({
       model: MODEL,
       messages: [
         {
           role: 'system',
-          content: 'You are a direct, expert accessibility compliance analyst. Write in a confident, authoritative voice. No fluff. Respond with plain text only. /no_think',
+          content: `You write sharp, human accessibility audit summaries — like a senior consultant giving a client a verbal briefing. 
+Tone: direct, confident, conversational. No corporate jargon, no bullet points, no bold markdown, no preamble like "Here is a summary".
+Just write 2 plain sentences that a non-technical stakeholder would immediately understand.
+If the site passes, say so clearly and positively. /no_think`,
         },
         {
           role: 'user',
-          content: `Write a 2-sentence executive summary of this WCAG audit result for ${url}.
+          content: `Summarize this WCAG 2.1 AA audit in 2 plain sentences. Do not start with "Here is" or repeat the URL.
 
-Score: ${score}/100 (Grade ${grade})
-Critical violations: ${criticalCount}
-Warnings: ${warningCount}  
-Legal risk: ${legalRisk}
+Site: ${url}
+Score: ${score}/100 | Grade: ${grade} | Legal risk: ${legalRisk}
+Critical violations: ${criticalCount} | Warnings: ${warningCount}
+${passingNote}
+${topViolations ? `Key issues:\n${topViolations}` : ''}
 
-Top issues:
-${topViolations}
-
-Be specific — mention the actual violation types found. Start with the most impactful finding.`,
+First sentence: the headline verdict (what the overall state is and the most important finding).
+Second sentence: what that means practically — who is affected or what action is needed.`,
         },
       ],
-      max_tokens: 200,
-      temperature: 0.2,
+      max_tokens: 120,
+      temperature: 0.3,
     })
 
     summary = completion.choices[0]?.message?.content
       ?.replace(/<think>[\s\S]*?<\/think>/gi, '')
+      .replace(/\*\*/g, '')   // strip any stray markdown bold
+      .replace(/`/g, '')       // strip backticks
       .trim() ?? ''
   } catch {
     summary = `Found ${criticalCount} critical and ${warningCount} warning violations across ${totalElements} analyzed elements. ${legalRisk === 'High' ? 'This site carries high ADA litigation risk and requires immediate remediation.' : legalRisk === 'Medium' ? 'Moderate accessibility issues detected — remediation recommended.' : 'Minor accessibility improvements identified.'}`

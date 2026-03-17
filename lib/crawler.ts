@@ -83,6 +83,24 @@ export async function crawlUrl(url: string, log: AgentLogEntry[], prefetchedHtml
     log.push({ agent: 'Crawler', step: 'HTML fetched', detail: `${Math.round(html.length / 1024)}KB via ${fetchMethod}`, timestamp: Date.now() })
   }
 
+  // Guard: detect proxy/server error pages before wasting Nemotron calls on them
+  const errorPagePatterns = [
+    /\b(400|403|404|500|502|503)\s+(bad request|forbidden|not found|error|gateway|unavailable)/i,
+    /<title>[^<]*(error|not found|forbidden|bad request|access denied)[^<]*<\/title>/i,
+    /cloudflare.*ray id/i,
+    /this page (isn't|is not) (working|available)/i,
+  ]
+  const htmlPreview = html.slice(0, 2000)
+  const isErrorPage = errorPagePatterns.some(p => p.test(htmlPreview))
+  if (isErrorPage) {
+    const titleMatch = html.match(/<title>([^<]*)<\/title>/i)
+    const errorTitle = titleMatch?.[1]?.trim() ?? 'Unknown error'
+    throw new Error(
+      `FETCH_BLOCKED:${url}|The proxy returned an error page ("${errorTitle}") instead of the actual site. ` +
+      `Try using the "Paste HTML" option: open ${url} in your browser, press Ctrl+U to view source, and paste the HTML.`
+    )
+  }
+
   const $ = load(html)
   const pageTitle = $('title').text().trim() || url
   const elements: ExtractedElement[] = []
@@ -179,6 +197,39 @@ export async function crawlUrl(url: string, log: AgentLogEntry[], prefetchedHtml
     const imgs        = $(el).find('img')
     const imgAlts     = imgs.map((_, img) => $(img).attr('alt') ?? 'NO_ALT').get()
     const hasOnlyImg  = imgs.length > 0 && !visibleText.trim()
+    const ariaLabel   = $(el).attr('aria-label') ?? ''
+    const title       = $(el).attr('title') ?? ''
+
+    // Evaluate image-only link accessible name quality
+    let linkContext = ''
+    if (hasOnlyImg) {
+      const firstAlt = imgAlts[0] ?? ''
+      if (firstAlt === '' || firstAlt === 'NO_ALT') {
+        linkContext = `CRITICAL: Image-only link with empty/missing alt — no accessible name at all (WCAG 2.4.4 F89)`
+      } else if (ariaLabel || title) {
+        linkContext = `PASS: Image-only link has accessible name via ${ariaLabel ? `aria-label="${ariaLabel}"` : `title="${title}"`}`
+      } else {
+        // Evaluate alt text quality for the link context
+        // A logo/brand image alt like "W3C logo", "BBC logo" IS sufficient for link purpose
+        // when the link goes to that org's homepage — the destination is clear
+        const looksDescriptive =
+          firstAlt.length >= 4 &&
+          !['image','photo','icon','logo only','graphic','img'].includes(firstAlt.toLowerCase()) &&
+          !/^\d+$/.test(firstAlt)
+        if (looksDescriptive) {
+          linkContext = `PASS: Image-only link — alt="${firstAlt}" provides an accessible name. Minor: consider if alt describes link destination (not just image content).`
+        } else {
+          linkContext = `WARNING: Image-only link — alt="${firstAlt}" is too generic to describe the link's destination (WCAG 2.4.4)`
+        }
+      }
+    }
+
+    // Only flag genuinely non-descriptive visible text
+    const NONDESCRIPTIVE = new Set(['read more...', 'read more', 'click here', 'more', 'here', 'link', 'this', 'details'])
+    const visibleLower = visibleText.trim().toLowerCase()
+    if (!hasOnlyImg && NONDESCRIPTIVE.has(visibleLower)) {
+      linkContext = `WARNING: non-descriptive link text "${visibleText}" — violates WCAG 2.4.4 F84`
+    }
 
     elements.push({
       type: 'link',
@@ -187,13 +238,8 @@ export async function crawlUrl(url: string, log: AgentLogEntry[], prefetchedHtml
       attributes: getAttrs(el as Element),
       textContent: visibleText,
       context: [
-        visibleText === 'Read More...' || visibleText === 'Read more...' || visibleText.toLowerCase() === 'more' || visibleText.toLowerCase() === 'click here'
-          ? `WARNING: non-descriptive link text "${visibleText}" — violates WCAG 2.4.4`
-          : '',
-        hasOnlyImg
-          ? `Image-only link: img alt values are [${imgAlts.join(', ')}]. Empty alt on image-only link = no accessible name (WCAG 2.4.4 + 4.1.2 failure)`
-          : '',
-        imgs.length > 0 ? `Contains ${imgs.length} image(s) with alt: [${imgAlts.join(', ')}]` : '',
+        linkContext,
+        imgs.length > 0 && !linkContext ? `Contains ${imgs.length} image(s) with alt: [${imgAlts.join(', ')}]` : '',
       ].filter(Boolean).join(' | '),
     })
   })
