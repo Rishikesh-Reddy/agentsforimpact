@@ -4,20 +4,20 @@ import { analyzeElements } from '@/lib/analyzer'
 import { generateReport } from '@/lib/reporter'
 import type { AgentLogEntry } from '@/lib/types'
 
-export const maxDuration = 60  // allow up to 60s for full analysis
+export const maxDuration = 300
 
 export async function POST(req: NextRequest) {
   const log: AgentLogEntry[] = []
 
   try {
     const body = await req.json()
-    const { url } = body as { url: string }
+    // html is optional — sent by frontend when server-side fetch was blocked
+    const { url, html: prefetchedHtml } = body as { url: string; html?: string }
 
     if (!url || typeof url !== 'string') {
       return NextResponse.json({ error: 'URL is required' }, { status: 400 })
     }
 
-    // Normalize URL
     let normalizedUrl = url.trim()
     if (!normalizedUrl.startsWith('http://') && !normalizedUrl.startsWith('https://')) {
       normalizedUrl = 'https://' + normalizedUrl
@@ -37,7 +37,22 @@ export async function POST(req: NextRequest) {
     }
 
     // ── AGENT 1: CRAWLER ─────────────────────────────────────────
-    const { elements, pageTitle } = await crawlUrl(normalizedUrl, log)
+    let elements, pageTitle
+    try {
+      const result = await crawlUrl(normalizedUrl, log, prefetchedHtml)
+      elements = result.elements
+      pageTitle = result.pageTitle
+    } catch (crawlErr: unknown) {
+      const msg = crawlErr instanceof Error ? crawlErr.message : String(crawlErr)
+      // Signal to frontend: server fetch blocked, please retry with browser-fetched HTML
+      if (msg.startsWith('FETCH_BLOCKED:')) {
+        return NextResponse.json(
+          { error: msg, fetchBlocked: true, agentLog: log },
+          { status: 422 }
+        )
+      }
+      throw crawlErr
+    }
 
     if (elements.length === 0) {
       return NextResponse.json(
@@ -52,10 +67,7 @@ export async function POST(req: NextRequest) {
     // ── AGENT 3: REPORTER ────────────────────────────────────────
     const report = await generateReport(normalizedUrl, violations, elements.length, log)
 
-    return NextResponse.json({
-      ...report,
-      pageTitle,
-    })
+    return NextResponse.json({ ...report, pageTitle })
 
   } catch (err: unknown) {
     const message = err instanceof Error ? err.message : 'Analysis failed'

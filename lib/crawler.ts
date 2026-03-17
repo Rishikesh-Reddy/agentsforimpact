@@ -1,9 +1,10 @@
-import * as cheerio from 'cheerio'
+import { load } from 'cheerio'
+import type { Element, AnyNode } from 'domhandler'
 import type { ExtractedElement, AgentLogEntry } from './types'
 
 const MAX_ELEMENTS = 60
 
-export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
+export async function crawlUrl(url: string, log: AgentLogEntry[], prefetchedHtml?: string): Promise<{
   elements: ExtractedElement[]
   pageTitle: string
   rawHtml: string
@@ -15,65 +16,74 @@ export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
   let html: string
   let fetchMethod = 'direct'
 
-  // Strategy 1: direct fetch with realistic browser headers
-  try {
-    const res = await fetch(url, {
-      headers: {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
-        'Accept-Language': 'en-US,en;q=0.9',
-        'Accept-Encoding': 'gzip, deflate, br',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-        'Sec-Fetch-Dest': 'document',
-        'Sec-Fetch-Mode': 'navigate',
-        'Sec-Fetch-Site': 'none',
-        'Upgrade-Insecure-Requests': '1',
-      },
-      redirect: 'follow',
-      signal: AbortSignal.timeout(15000),
-    })
-    if (!res.ok) throw new Error(`HTTP ${res.status}`)
-    html = await res.text()
-  } catch (directErr: unknown) {
-    const directMsg = directErr instanceof Error ? directErr.message : String(directErr)
-    log.push({ agent: 'Crawler', step: 'Direct fetch blocked', detail: `${directMsg} — trying proxy`, timestamp: Date.now() })
-
-    // Strategy 2: allorigins.win — free open-source proxy that fetches as a real browser
+  // If the browser already fetched the HTML (bypassing server-side 403s), use it directly
+  if (prefetchedHtml && prefetchedHtml.length > 500) {
+    html = prefetchedHtml
+    fetchMethod = 'browser-prefetch'
+    log.push({ agent: 'Crawler', step: 'Using browser-fetched HTML', detail: `${Math.round(html.length / 1024)}KB`, timestamp: Date.now() })
+  } else {
+    // Strategy 1: direct server-side fetch with realistic browser headers
     try {
-      fetchMethod = 'allorigins'
-      const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(url)}`
-      const proxyRes = await fetch(proxyUrl, { signal: AbortSignal.timeout(20000) })
-      if (!proxyRes.ok) throw new Error(`Proxy HTTP ${proxyRes.status}`)
-      const proxyData = await proxyRes.json() as { contents?: string }
-      if (!proxyData.contents) throw new Error('Proxy returned empty contents')
-      html = proxyData.contents
-    } catch (proxyErr: unknown) {
-      const proxyMsg = proxyErr instanceof Error ? proxyErr.message : String(proxyErr)
+      const res = await fetch(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Cache-Control': 'no-cache',
+          'Pragma': 'no-cache',
+          'Sec-Fetch-Dest': 'document',
+          'Sec-Fetch-Mode': 'navigate',
+          'Sec-Fetch-Site': 'none',
+          'Upgrade-Insecure-Requests': '1',
+        },
+        redirect: 'follow',
+        signal: AbortSignal.timeout(15000),
+      })
+      if (!res.ok) throw new Error(`HTTP ${res.status}`)
+      html = await res.text()
+    } catch (directErr: unknown) {
+      const directMsg = directErr instanceof Error ? directErr.message : String(directErr)
+      log.push({ agent: 'Crawler', step: 'Direct fetch blocked', detail: `${directMsg} — trying proxies`, timestamp: Date.now() })
 
-      // Strategy 3: corsproxy.io as second fallback
+      // Strategy 2: allorigins.win
       try {
-        fetchMethod = 'corsproxy'
-        const corsRes = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, {
-          headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AccessGuard/1.0)' },
+        fetchMethod = 'allorigins'
+        const proxyRes = await fetch(`https://api.allorigins.win/get?url=${encodeURIComponent(url)}`, {
           signal: AbortSignal.timeout(20000),
         })
-        if (!corsRes.ok) throw new Error(`corsproxy HTTP ${corsRes.status}`)
-        html = await corsRes.text()
-      } catch (corsErr: unknown) {
-        const corsMsg = corsErr instanceof Error ? corsErr.message : String(corsErr)
-        throw new Error(
-          `All fetch strategies failed for ${url}. ` +
-          `Direct: ${directMsg} | allorigins: ${proxyMsg} | corsproxy: ${corsMsg}. ` +
-          `The site may require authentication or actively block all crawlers.`
-        )
+        if (!proxyRes.ok) throw new Error(`Proxy HTTP ${proxyRes.status}`)
+        const proxyData = await proxyRes.json() as { contents?: string }
+        if (!proxyData.contents) throw new Error('Proxy returned empty contents')
+        html = proxyData.contents
+      } catch (proxyErr: unknown) {
+        const proxyMsg = proxyErr instanceof Error ? proxyErr.message : String(proxyErr)
+
+        // Strategy 3: corsproxy.io
+        try {
+          fetchMethod = 'corsproxy'
+          const corsRes = await fetch(`https://corsproxy.io/?${encodeURIComponent(url)}`, {
+            headers: { 'User-Agent': 'Mozilla/5.0 (compatible; AccessGuard/1.0)' },
+            signal: AbortSignal.timeout(20000),
+          })
+          if (!corsRes.ok) throw new Error(`corsproxy HTTP ${corsRes.status}`)
+          html = await corsRes.text()
+        } catch (corsErr: unknown) {
+          const corsMsg = corsErr instanceof Error ? corsErr.message : String(corsErr)
+          // All server-side strategies failed — signal to frontend to try browser fetch
+          throw new Error(
+            `FETCH_BLOCKED:${url}|Direct: ${directMsg} | allorigins: ${proxyMsg} | corsproxy: ${corsMsg}`
+          )
+        }
       }
     }
   }
 
-  log.push({ agent: 'Crawler', step: 'HTML fetched', detail: `${Math.round(html.length / 1024)}KB via ${fetchMethod}`, timestamp: Date.now() })
+  if (fetchMethod !== 'browser-prefetch') {
+    log.push({ agent: 'Crawler', step: 'HTML fetched', detail: `${Math.round(html.length / 1024)}KB via ${fetchMethod}`, timestamp: Date.now() })
+  }
 
-  const $ = cheerio.load(html)
+  const $ = load(html)
   const pageTitle = $('title').text().trim() || url
   const elements: ExtractedElement[] = []
 
@@ -82,7 +92,7 @@ export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
     return s.length > n ? s.slice(0, n) + '…' : s
   }
 
-  function getAttrs(el: cheerio.Element): Record<string, string> {
+  function getAttrs(el: Element): Record<string, string> {
     const attrs: Record<string, string> = {}
     if (el.type === 'tag' && el.attribs) {
       for (const [k, v] of Object.entries(el.attribs)) {
@@ -92,7 +102,7 @@ export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
     return attrs
   }
 
-  function outerHtml(el: cheerio.AnyNode): string {
+  function outerHtml(el: AnyNode): string {
     return truncate($.html(el) ?? '', 300)
   }
 
@@ -101,11 +111,11 @@ export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
   // overly-verbose, filename-based) must reach the model — don't filter here.
   $('img').each((_, el) => {
     if (elements.length >= MAX_ELEMENTS) return false
-    const attrs  = getAttrs(el as cheerio.Element)
+    const attrs  = getAttrs(el as Element)
     const alt    = attrs.alt
     const src    = attrs.src ?? ''
     const parent = $(el).parent()
-    const parentTag  = (parent[0] as cheerio.Element)?.name ?? ''
+    const parentTag  = (parent[0] as Element)?.name ?? ''
     const parentHref = parent.attr('href') ?? ''
     const siblingText = parentTag === 'a' ? truncate(parent.clone().children('img').remove().end().text()) : ''
 
@@ -156,7 +166,7 @@ export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
       type: 'image',
       html: outerHtml(el),
       selector: '[style*="background"]',
-      attributes: getAttrs(el as cheerio.Element),
+      attributes: getAttrs(el as Element),
       textContent: text,
       context: `CSS background-image: url(${imageUrl}). title="${titleAttr}", aria-label="${ariaLabel}", role="${role}", visible text="${text}". WCAG 1.1.1: if this image conveys information it needs a text alternative — title alone is NOT sufficient.`,
     })
@@ -174,7 +184,7 @@ export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
       type: 'link',
       html: outerHtml(el),
       selector: 'a',
-      attributes: getAttrs(el as cheerio.Element),
+      attributes: getAttrs(el as Element),
       textContent: visibleText,
       context: [
         visibleText === 'Read More...' || visibleText === 'Read more...' || visibleText.toLowerCase() === 'more' || visibleText.toLowerCase() === 'click here'
@@ -194,8 +204,8 @@ export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
     elements.push({
       type: 'button',
       html: outerHtml(el),
-      selector: (el as cheerio.Element).name ?? 'button',
-      attributes: getAttrs(el as cheerio.Element),
+      selector: (el as Element).name ?? 'button',
+      attributes: getAttrs(el as Element),
       textContent: truncate($(el).text()),
     })
   })
@@ -215,8 +225,8 @@ export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
     elements.push({
       type: 'input',
       html: outerHtml(el),
-      selector: (el as cheerio.Element).name ?? 'input',
-      attributes: getAttrs(el as cheerio.Element),
+      selector: (el as Element).name ?? 'input',
+      attributes: getAttrs(el as Element),
       textContent: labelByFor || ariaLabel || placeholder || '',
       context: hasAccessibleName
         ? `Accessible name found: label="${labelByFor}", aria-label="${ariaLabel}", aria-labelledby="${ariaLabelBy}"`
@@ -228,7 +238,7 @@ export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
   const headings: { level: number; text: string; html: string }[] = []
   $('h1,h2,h3,h4,h5,h6').each((_, el) => {
     headings.push({
-      level: parseInt((el as cheerio.Element).name.replace('h', '')),
+      level: parseInt((el as Element).name.replace('h', '')),
       text: truncate($(el).text()),
       html: outerHtml(el),
     })
@@ -237,7 +247,7 @@ export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
   // FIX: also detect visually-styled headings that are NOT using heading elements
   const fakeHeadings: string[] = []
   $('[class*="title"], [class*="heading"], [class*="header"], [id*="title"], [id*="heading"]').each((_, el) => {
-    const tag = (el as cheerio.Element).name
+    const tag = (el as Element).name
     if (!['h1','h2','h3','h4','h5','h6'].includes(tag)) {
       const text = truncate($(el).text(), 60)
       if (text.length > 2 && text.length < 80) fakeHeadings.push(`<${tag} class="${$(el).attr('class') ?? ''}">${text}</${tag}>`)
@@ -275,7 +285,7 @@ export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
       type: 'table',
       html: outerHtml(el),
       selector: 'table',
-      attributes: getAttrs(el as cheerio.Element),
+      attributes: getAttrs(el as Element),
       context: [
         `Has caption: ${hasCaption}, Has th: ${hasTh}, Has scope: ${hasScope}, Has summary: ${hasSummary}`,
         `Cell count: ${cellCount}, Nested tables: ${nestedTable}`,
@@ -291,7 +301,7 @@ export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
       type: 'video',
       html: outerHtml(el),
       selector: 'video',
-      attributes: getAttrs(el as cheerio.Element),
+      attributes: getAttrs(el as Element),
     })
   })
 
@@ -302,7 +312,7 @@ export async function crawlUrl(url: string, log: AgentLogEntry[]): Promise<{
       type: 'iframe',
       html: outerHtml(el),
       selector: 'iframe',
-      attributes: getAttrs(el as cheerio.Element),
+      attributes: getAttrs(el as Element),
     })
   })
 
